@@ -102,8 +102,7 @@ HyperShader is provided "as is", without warranty of any kind. To the maximum ex
 
 **HyperShader**, ekran kartını sonuna kadar zorlamak için yapılmış hacimsel bir WebGL shader'ıdır.
 
-> [!WARNING]
-> HyperShader bir stres testidir. Cihazı ısıtabilir, pili hızla bitirebilir ve tarayıcıyı birkaç saniye dondurabilir. Başlamadan önce sayfadaki sorumluluk reddini oku. Kullanım tamamen kendi sorumluluğundadır.
+> **⚠ Uyarı:** HyperShader bir stres testidir. Cihazı ısıtabilir, pili hızla bitirebilir ve tarayıcıyı birkaç saniye dondurabilir. Başlamadan önce sayfadaki sorumluluk reddini oku. Kullanım tamamen kendi sorumluluğundadır.
 
 **Özellikler**
 
