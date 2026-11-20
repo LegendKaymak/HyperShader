@@ -311,7 +311,10 @@ const I18N = {
     r4t:"Visuals", r4d:"No flashing, only slowly flowing colours.",
     levelLbl:"Load level",
     l4:"Beyond", s4:"512 steps · 8× supersampling · tiled render",
-    beyondNote:"Beyond renders a single frame at 8× resolution, tile by tile. One frame can take minutes and needs a lot of video memory. Rotating the view starts a new render.",
+    beyondNote:"Beyond builds every screen pixel from 64 samples (8× in each direction), tile by tile. One frame can take minutes. If the graphics driver resets, the render does not close; it recovers by itself with smaller tiles. Rotating the view starts a new render.",
+    gpuReset:"The graphics driver reset. Beyond keeps running and restarts the render with smaller tiles…",
+    recovered:"Recovered. The render is continuing.",
+    noRestore:"The browser has not given the graphics context back yet. If nothing changes, reload the page.",
     scaleLbl:"Scale", progress:"Render progress", trillion:"trillion",
     done:"Render complete. Save a screenshot to keep it.", encoding:"Encoding image…",
     l0:"Warm-up", l1:"Heavy", l2:"Crushing", l3:"Doomsday",
@@ -356,7 +359,10 @@ const I18N = {
     r4t:"Görüntü", r4d:"Yanıp sönme yok, yavaş akan renkler var.",
     levelLbl:"Yük seviyesi",
     l4:"Kıyamet Ötesi", s4:"512 adım · 8× süper örnek · parça parça render",
-    beyondNote:"Kıyamet Ötesi tek bir kareyi 8 kat çözünürlükte, parça parça işler. Bir kare dakikalar sürebilir ve çok ekran belleği ister. Görüşü döndürmek yeni bir render başlatır.",
+    beyondNote:"Kıyamet Ötesi ekrandaki her pikseli 64 örnekten (her yönde 8 kat) parça parça oluşturur. Bir kare dakikalar sürebilir. Grafik sürücüsü sıfırlanırsa render kapanmaz; daha küçük parçalarla kendi kendine toparlanır. Görüşü döndürmek yeni bir render başlatır.",
+    gpuReset:"Grafik sürücüsü sıfırlandı. Kıyamet Ötesi kapanmıyor; render daha küçük parçalarla yeniden başlıyor…",
+    recovered:"Toparlandı. Render devam ediyor.",
+    noRestore:"Tarayıcı grafik bağlamını henüz geri vermedi. Bir şey değişmezse sayfayı yenile.",
     scaleLbl:"Ölçek", progress:"Render ilerlemesi", trillion:"trilyon",
     done:"Render tamamlandı. Saklamak için ekran görüntüsü al.", encoding:"Görüntü kodlanıyor…",
     l0:"Isınma", l1:"Ağır", l2:"Ezici", l3:"Kıyamet",
@@ -404,8 +410,8 @@ const PRESETS = [
   {steps:512, light:48, oct:8, scale:"dpr15"},
   {steps:512, light:48, oct:8, scale:8, tiled:true},
 ];
-const TILE = 128, MAX_AREA = 134217728;
-let LIM = 4096, pass = null;
+const SS = 8, MAX_AREA = 134217728;
+let LIM = 4096, pass = null, TS = 256, recovering = false, restoreTimer = 0;
 const $ = id => document.getElementById(id);
 const canvas = $("c"), gate = $("gate"), topUI = $("top"), dock = $("dock");
 const acks = ["ack1","ack2","ack3"].map($), go = $("go");
@@ -444,6 +450,7 @@ const FS = `
 precision highp float;
 uniform vec2 uRes; uniform float uTime; uniform vec2 uRot;
 uniform float uSteps, uLSteps, uOct;
+uniform vec2 uOff;
 
 float hash(vec3 p){ p = fract(p*0.3183099 + .1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
 float noise(vec3 x){
@@ -472,7 +479,8 @@ float density(vec3 p, out float heat){
 vec3 aces(vec3 x){ return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14), 0., 1.); }
 
 void main(){
-  vec2 uv = (gl_FragCoord.xy - .5*uRes) / uRes.y;
+  vec2 fc = gl_FragCoord.xy + uOff;
+  vec2 uv = (fc - .5*uRes) / uRes.y;
   vec3 ro = 4.3*vec3(cos(uRot.y)*sin(uRot.x), sin(uRot.y), cos(uRot.y)*cos(uRot.x));
   vec3 fw = normalize(-ro), rt = normalize(cross(vec3(0,1,0), fw)), up = cross(fw, rt);
   vec3 rd = normalize(fw*1.6 + rt*uv.x + up*uv.y);
@@ -485,7 +493,7 @@ void main(){
   h = sqrt(h);
   float t0 = max(-b - h, 0.), t1 = -b + h;
   float dt = (t1 - t0) / uSteps;
-  float t = t0 + dt*hash(vec3(gl_FragCoord.xy, fract(uTime)*91.));
+  float t = t0 + dt*hash(vec3(fc, fract(uTime)*91.));
 
   vec3 Lp = vec3(2.4*cos(uTime*.4), 1.8, 2.4*sin(uTime*.4));
   vec3 col = vec3(0.); float T = 1.;
@@ -514,30 +522,58 @@ void main(){
   gl_FragColor = vec4(pow(col, vec3(.4545)), 1.);
 }`;
 
+const DS = `
+precision highp float;
+uniform sampler2D uTex; uniform vec2 uTexSize; uniform vec2 uDst;
+void main(){
+  vec2 local = floor(gl_FragCoord.xy - uDst);
+  vec3 c = vec3(0.);
+  for(int y=0;y<8;y++) for(int x=0;x<8;x++){
+    vec2 tc = (local*8.0 + vec2(float(x), float(y)) + .5) / uTexSize;
+    c += pow(texture2D(uTex, tc).rgb, vec3(2.2));
+  }
+  gl_FragColor = vec4(pow(c/64., vec3(1./2.2)), 1.);
+}`;
+
+let prog = null, dprog = null, fbo = null, ftex = null, D = {};
 let gl = null, U = {}, raf = 0, running = false, paused = false, lvl = 1;
 let start = 0, pausedAt = 0, yaw = .6, pit = .35, drag = null, autoSpin = true, wantShot = false;
 
 function initGL(){
   gl = canvas.getContext("webgl", {antialias:false, powerPreference:"high-performance", preserveDrawingBuffer:true});
-  if(!gl) throw new Error(t("noGL"));
+  if(!gl || gl.isContextLost()) throw new Error(t("noGL"));
   const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
     if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(t("compile") + gl.getShaderInfoLog(s)); return s; };
-  const prog = gl.createProgram();
-  gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
-  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
-  gl.linkProgram(prog);
-  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-  gl.useProgram(prog);
+  const link = fs => { const p = gl.createProgram();
+    gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, "p"); gl.linkProgram(p);
+    if(!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; };
+  prog = link(FS); dprog = link(DS);
   gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
-  const loc = gl.getAttribLocation(prog, "p"); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-  ["uRes","uTime","uRot","uSteps","uLSteps","uOct"].forEach(n => U[n] = gl.getUniformLocation(prog, n));
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  U = {}; D = {};
+  ["uRes","uTime","uRot","uSteps","uLSteps","uOct","uOff"].forEach(n => U[n] = gl.getUniformLocation(prog, n));
+  ["uTex","uTexSize","uDst"].forEach(n => D[n] = gl.getUniformLocation(dprog, n));
+  gl.useProgram(prog);
   const vp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
   LIM = Math.min(vp[0], vp[1], gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), 16384);
+  makeFBO();
+}
+function makeFBO(){
+  if(ftex) { try { gl.deleteTexture(ftex); gl.deleteFramebuffer(fbo); } catch(e){} }
+  ftex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, ftex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, TS, TS, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, ftex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
 function scaleFor(p){
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  if(p.tiled) return dpr;
   return p.scale === "dpr" ? dpr : p.scale === "dpr15" ? dpr*1.5 : p.scale;
 }
 function resize(){
@@ -546,7 +582,8 @@ function resize(){
   const f = Math.min(1, LIM / Math.max(w, h), Math.sqrt(MAX_AREA / (w*h)));
   if(f < 1){ w = Math.max(1, Math.floor(w*f)); h = Math.max(1, Math.floor(h*f)); }
   if(canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; pass = null; }
-  const bw = gl ? gl.drawingBufferWidth : w, bh = gl ? gl.drawingBufferHeight : h;
+  const m = p.tiled ? SS : 1;
+  const bw = (gl ? gl.drawingBufferWidth : w) * m, bh = (gl ? gl.drawingBufferHeight : h) * m;
   $("res").textContent = bw + " × " + bh;
   $("scl").textContent = fmt(bw / innerWidth, 1) + "×";
   const calls = bw*bh*p.steps*(1 + p.light);
@@ -585,27 +622,45 @@ function updateProg(){
   $("bar").style.width = pc + "%";
 }
 function renderTiles(now, W, H){
+  const B = TS / SS;
   if(!pass || pass.W !== W || pass.H !== H){
     const tiles = [], cx = W/2, cy = H/2;
-    for(let y = 0; y < H; y += TILE) for(let x = 0; x < W; x += TILE) tiles.push([x, y]);
-    tiles.sort((a, b) => Math.hypot(a[0]+TILE/2-cx, a[1]+TILE/2-cy) - Math.hypot(b[0]+TILE/2-cx, b[1]+TILE/2-cy));
-    pass = {W, H, tiles, i:0, n:2, time:(now - start)/1000, yaw, pit, lastT:0, done:false};
-    gl.disable(gl.SCISSOR_TEST); gl.clearColor(.02, .015, .045, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    for(let y = 0; y < H; y += B) for(let x = 0; x < W; x += B) tiles.push([x, y]);
+    tiles.sort((a, b) => Math.hypot(a[0]+B/2-cx, a[1]+B/2-cy) - Math.hypot(b[0]+B/2-cx, b[1]+B/2-cy));
+    pass = {W, H, B, tiles, i:0, n:1, time:(now - start)/1000, yaw, pit, lastT:0, done:false};
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, W, H); gl.clearColor(.02, .015, .045, 1); gl.clear(gl.COLOR_BUFFER_BIT);
     updateProg();
   }
   if(pass.done) return;
-  if(pass.lastT){ const d = now - pass.lastT; if(d < 34) pass.n = Math.min(pass.n*2, 256); else if(d > 90) pass.n = Math.max(1, pass.n >> 1); }
+  if(pass.lastT){ const d = now - pass.lastT; if(d < 40) pass.n = Math.min(pass.n*2, 128); else if(d > 150) pass.n = Math.max(1, pass.n >> 1); }
   pass.lastT = now;
+  const VW = W*SS, VH = H*SS;
+  gl.useProgram(prog);
+  gl.uniform2f(U.uRes, VW, VH);
   gl.uniform1f(U.uTime, pass.time);
   gl.uniform2f(U.uRot, pass.yaw, pass.pit);
+  gl.useProgram(dprog);
+  gl.uniform1i(D.uTex, 0); gl.uniform2f(D.uTexSize, TS, TS);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, ftex);
   gl.enable(gl.SCISSOR_TEST);
   for(let k = 0; k < pass.n && pass.i < pass.tiles.length; k++){
     const [x, y] = pass.tiles[pass.i++];
-    gl.scissor(x, y, Math.min(TILE, W - x), Math.min(TILE, H - y));
+    const bw = Math.min(B, W - x), bh = Math.min(B, H - y);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.useProgram(prog);
+    gl.uniform2f(U.uOff, x*SS, y*SS);
+    gl.viewport(0, 0, TS, TS); gl.scissor(0, 0, bw*SS, bh*SS);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(dprog);
+    gl.uniform2f(D.uDst, x, y);
+    gl.viewport(0, 0, W, H); gl.scissor(x, y, bw, bh);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.flush();
   }
   gl.disable(gl.SCISSOR_TEST);
+  gl.useProgram(prog);
   updateProg();
   if(pass.i >= pass.tiles.length){ pass.done = true; toast(t("done"), 4500); }
 }
@@ -613,15 +668,18 @@ function renderTiles(now, W, H){
 let last = 0, acc = 0, frames = 0, slowFor = 0;
 function frame(now){
   raf = requestAnimationFrame(frame);
-  if(paused || !gl) return;
+  if(paused || !gl || gl.isContextLost()) return;
   const p = PRESETS[lvl];
   const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  if(!W || !H) return;
+  gl.useProgram(prog);
   gl.viewport(0, 0, W, H);
   gl.uniform2f(U.uRes, W, H);
   gl.uniform1f(U.uSteps, p.steps); gl.uniform1f(U.uLSteps, p.light); gl.uniform1f(U.uOct, p.oct);
   if(p.tiled) renderTiles(now, W, H);
   else {
     gl.disable(gl.SCISSOR_TEST);
+    gl.uniform2f(U.uOff, 0, 0);
     if(autoSpin && !drag) yaw += .0025;
     gl.uniform1f(U.uTime, (now - start)/1000);
     gl.uniform2f(U.uRot, yaw, pit);
@@ -638,8 +696,10 @@ function frame(now){
       hist.push(fps); if(hist.length > 40) hist.shift(); drawSpark();
       slowFor = fps < 4 ? slowFor + acc : 0;
       const al = $("alert");
-      if(!p.tiled && slowFor > 3000 && lvl > 0){ al.textContent = t("slow"); al.hidden = false; }
-      else if(p.tiled || fps >= 4) al.hidden = true;
+      if(!p.tiled){
+        if(slowFor > 3000 && lvl > 0){ al.textContent = t("slow"); al.hidden = false; }
+        else if(fps >= 4) al.hidden = true;
+      }
       acc = 0; frames = 0;
     }
   }
@@ -649,7 +709,7 @@ function frame(now){
 function begin(){
   const l = +document.querySelector('input[name="lvl"]:checked').value;
   $("err").hidden = true;
-  try { if(!gl) initGL(); } catch(e){ showErr(e.message); gl = null; return; }
+  try { if(!gl || gl.isContextLost()) initGL(); } catch(e){ showErr(e.message); gl = null; return; }
   gate.hidden = true; topUI.hidden = false; dock.hidden = false;
   running = true; paused = false; pass = null; setPauseIcon();
   setLevel(l); resize();
@@ -658,9 +718,9 @@ function begin(){
   cancelAnimationFrame(raf); raf = requestAnimationFrame(frame);
 }
 function stop(){
-  running = false; pass = null; cancelAnimationFrame(raf);
+  running = false; pass = null; recovering = false; clearTimeout(restoreTimer); cancelAnimationFrame(raf);
   if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
-  if(gl){ gl.disable(gl.SCISSOR_TEST); gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT); }
+  if(gl && !gl.isContextLost()){ gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.disable(gl.SCISSOR_TEST); gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT); }
   canvas.width = 1; canvas.height = 1;
   topUI.hidden = true; dock.hidden = true; gate.hidden = false;
   const r = document.querySelector('input[name="lvl"][value="'+lvl+'"]'); if(r) r.checked = true;
@@ -712,10 +772,25 @@ addEventListener("keydown", e => {
   else if(/^[1-5]$/.test(e.key)) setLevel(+e.key - 1);
 });
 addEventListener("resize", () => { if(running) resize(); });
-document.addEventListener("visibilitychange", () => { if(document.hidden && running && !paused) togglePause(); });
+document.addEventListener("visibilitychange", () => { if(document.hidden && running && !paused && !PRESETS[lvl].tiled) togglePause(); });
 canvas.addEventListener("webglcontextlost", e => {
-  e.preventDefault(); gl = null; U = {}; stop();
+  e.preventDefault();
+  if(running && PRESETS[lvl].tiled){
+    recovering = true; pass = null; gl = null;
+    TS = Math.max(64, TS >> 1);
+    const al = $("alert"); al.textContent = t("gpuReset"); al.hidden = false;
+    clearTimeout(restoreTimer);
+    restoreTimer = setTimeout(() => { if(recovering) $("alert").textContent = t("noRestore"); }, 6000);
+    return;
+  }
+  gl = null; U = {}; stop();
   showErr(t("lost"));
+});
+canvas.addEventListener("webglcontextrestored", () => {
+  if(!(running && recovering)) return;
+  try { initGL(); } catch(e){ $("alert").textContent = t("noRestore"); return; }
+  recovering = false; clearTimeout(restoreTimer); pass = null;
+  resize(); $("alert").hidden = true; toast(t("recovered"), 3000);
 });
 
 canvas.addEventListener("pointerdown", e => { drag = {x:e.clientX, y:e.clientY, moved:false}; autoSpin = false; canvas.setPointerCapture(e.pointerId); });
